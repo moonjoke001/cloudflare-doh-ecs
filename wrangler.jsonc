@@ -14,7 +14,14 @@
     "DOMESTIC_DOH_URL": "https://dns.alidns.com/dns-query",
     "DOMESTIC_FALLBACK_DOH_URL": "https://doh.pub/dns-query",
     "GLOBAL_DOH_URL": "https://dns.google/dns-query",
-    "GLOBAL_FALLBACK_DOH_URL": "https://cloudflare-dns.com/dns-query"
+    "GLOBAL_FALLBACK_DOH_URL": "https://cloudflare-dns.com/dns-query",
+    "DOMESTIC_DOH_ECS": "on",
+    "DOMESTIC_FALLBACK_DOH_ECS": "on",
+    "GLOBAL_DOH_ECS": "off",
+    "GLOBAL_FALLBACK_DOH_ECS": "on",
+    "UPSTREAM_TIMEOUT_MS": "1500",
+    "HEDGE_DELAY_MS": "800",
+    "CACHE_MAX_AGE_S": "300"
   },
   "triggers": {
     "crons": ["17 3 * * *"]

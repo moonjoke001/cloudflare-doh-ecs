@@ -1,17 +1,31 @@
-import { toArrayBuffer } from "./binary";
-import { buildDnsError, DnsFormatError, parseDnsMessage, validateUpstreamResponse } from "./dns";
+import { toArrayBuffer, writeU16 } from "./binary";
+import {
+  buildDnsError,
+  DnsFormatError,
+  minAnswerTtl,
+  parseDnsMessage,
+  validateUpstreamResponse,
+  type DnsMessageInfo
+} from "./dns";
 import { rewriteEcs } from "./ecs";
-import { clientIpFromSingleHeader, clientIpFromXff, subnetForEcs } from "./ip";
+import {
+  clientIpFromSingleHeader,
+  clientIpFromXff,
+  subnetForEcs,
+  type EcsSubnet
+} from "./ip";
 import { ensureRules, isDomesticDomain, updateRules } from "./rules";
-import { readConfig, type WorkerConfig } from "./config";
+import { readConfig, type Upstream, type WorkerConfig } from "./config";
 import type { Env } from "./types";
 
 const MAX_REQUEST_BYTES = 4096;
 const MAX_RESPONSE_BYTES = 65535;
-const UPSTREAM_TIMEOUT_MS = 3000;
 const ECS_IPV4_PREFIX = 24;
 const ECS_IPV6_PREFIX = 56;
 const DNS_CONTENT_TYPE = "application/dns-message";
+
+// Workers 运行时提供 caches.default；@cloudflare/workers-types 旧版类型缺失时补声明。
+declare const caches: CacheStorage & { default: Cache };
 
 class UpstreamFailure extends Error {
   constructor(
@@ -134,9 +148,13 @@ async function readDnsRequest(request: Request, config: WorkerConfig): Promise<R
   return emptyResponse(405, { Allow: "GET, POST" });
 }
 
-async function fetchUpstream(url: string, query: Uint8Array): Promise<Uint8Array> {
+async function fetchUpstream(
+  url: string,
+  query: Uint8Array,
+  timeoutMs: number
+): Promise<Uint8Array> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     let response: Response;
     try {
@@ -181,7 +199,147 @@ async function fetchUpstream(url: string, query: Uint8Array): Promise<Uint8Array
   }
 }
 
-async function handleDns(request: Request, env: Env, config: WorkerConfig): Promise<Response> {
+function isCloudflareUpstream(url: string): boolean {
+  let hostname = "";
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    hostname === "cloudflare-dns.com" ||
+    hostname === "one.one.one.one" ||
+    hostname.endsWith(".cloudflare-dns.com")
+  );
+}
+
+/** 按上游 ECS 作用域决定发带 ECS 版还是干净原版。 */
+function queryForUpstream(
+  withEcsQuery: Uint8Array,
+  withoutEcsQuery: Uint8Array,
+  upstream: Upstream
+): { query: Uint8Array; withEcs: boolean } {
+  switch (upstream.ecs) {
+    case "on":
+      return { query: withEcsQuery, withEcs: true };
+    case "off":
+      return { query: withoutEcsQuery, withEcs: false };
+    case "cf-only":
+      return isCloudflareUpstream(upstream.url)
+        ? { query: withEcsQuery, withEcs: true }
+        : { query: withoutEcsQuery, withEcs: false };
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface UpstreamSuccess {
+  body: Uint8Array;
+  info: DnsMessageInfo;
+  withEcs: boolean;
+}
+
+async function tryUpstream(
+  upstream: Upstream,
+  query: Uint8Array,
+  withEcs: boolean,
+  parsed: DnsMessageInfo,
+  group: "domestic" | "global",
+  role: "primary" | "fallback",
+  timeoutMs: number
+): Promise<UpstreamSuccess | null> {
+  try {
+    const body = await fetchUpstream(upstream.url, query, timeoutMs);
+    const info = validateUpstreamResponse(body, parsed);
+    if ((info.flags & 0x000f) === 2) {
+      logUpstreamFailure(group, role, { reason: "dns_servfail" });
+      return null;
+    }
+    return { body, info, withEcs };
+  } catch (error) {
+    logUpstreamFailure(group, role, upstreamFailureDiagnostic(error));
+    return null;
+  }
+}
+
+function hexBytes(data: Uint8Array): string {
+  let out = "";
+  for (const byte of data) out += byte.toString(16).padStart(2, "0");
+  return out;
+}
+
+/**
+ * 热点缓存键：ECS 个性化回答按子网隔离存放（同 /24 共享），
+ * 干净回答全客户端共享。ruleName 为空（不可规范化）时不缓存。
+ */
+function cacheKeyFor(
+  parsed: DnsMessageInfo,
+  subnet: EcsSubnet | null,
+  withEcs: boolean
+): Request | null {
+  const name = parsed.question.name.ruleName;
+  if (name === null) return null;
+  const scope =
+    withEcs && subnet !== null
+      ? `ecs-${subnet.family}-${subnet.prefixLength}-${hexBytes(subnet.network)}`
+      : "noecs";
+  const qtype = parsed.question.type;
+  const qclass = parsed.question.class;
+  return new Request(`https://doh-cache.invalid/${qtype}/${qclass}/${scope}/${name}`);
+}
+
+async function cacheLookup(key: Request | null): Promise<Uint8Array | null> {
+  if (key === null) return null;
+  try {
+    if (typeof caches === "undefined") return null;
+    const hit = await caches.default.match(key);
+    if (hit === undefined) return null;
+    const body = new Uint8Array(await hit.arrayBuffer());
+    if (body.length < 12) return null;
+    return body;
+  } catch {
+    return null;
+  }
+}
+
+async function cacheStore(
+  key: Request | null,
+  success: UpstreamSuccess,
+  maxAgeS: number,
+  ctx?: ExecutionContext
+): Promise<void> {
+  if (key === null || maxAgeS === 0) return;
+  const ttl = minAnswerTtl(success.info);
+  if (ttl === null || ttl <= 0) return;
+  const age = Math.min(ttl, maxAgeS);
+  const stored = new Response(toArrayBuffer(success.body), {
+    headers: {
+      "Content-Type": DNS_CONTENT_TYPE,
+      "Cache-Control": `public, max-age=${age}`
+    }
+  });
+  const put = (async (): Promise<void> => {
+    try {
+      if (typeof caches !== "undefined") await caches.default.put(key, stored);
+    } catch {
+      // 缓存失败不影响本次回答。
+    }
+  })();
+  if (ctx !== undefined && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(put);
+  } else {
+    await put;
+  }
+}
+
+async function handleDns(
+  request: Request,
+  env: Env,
+  config: WorkerConfig,
+  ctx?: ExecutionContext
+): Promise<Response> {
   const readResult = await readDnsRequest(request, config);
   if (readResult instanceof Response) return readResult;
   const originalQuery = readResult;
@@ -193,13 +351,16 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
     return dnsResponse(buildDnsError(originalQuery, 1));
   }
 
-  let forwardedQuery: Uint8Array;
+  let withEcsQuery: Uint8Array;
+  let withoutEcsQuery: Uint8Array;
+  let subnet: EcsSubnet | null = null;
   try {
     const ip =
       clientIpFromXff(request.headers.get("x-forwarded-for")) ??
       clientIpFromSingleHeader(request.headers.get("cf-connecting-ip"));
-    const subnet = subnetForEcs(ip, ECS_IPV4_PREFIX, ECS_IPV6_PREFIX);
-    forwardedQuery = rewriteEcs(originalQuery, parsed, subnet);
+    subnet = subnetForEcs(ip, ECS_IPV4_PREFIX, ECS_IPV6_PREFIX);
+    withEcsQuery = rewriteEcs(originalQuery, parsed, subnet);
+    withoutEcsQuery = rewriteEcs(originalQuery, parsed, null);
   } catch (error) {
     if (error instanceof DnsFormatError) {
       return dnsResponse(buildDnsError(originalQuery, 1, parsed.question));
@@ -213,29 +374,84 @@ async function handleDns(request: Request, env: Env, config: WorkerConfig): Prom
     const rules = await ensureRules(env);
     domestic = rules !== null && isDomesticDomain(rules, ruleName);
   }
-  const upstreams = domestic ? config.domesticUrls : config.globalUrls;
+  const upstreams = domestic ? config.domestic : config.global;
   const group = domestic ? "domestic" : "global";
-  let upstreamIndex = 0;
-  for (const upstream of upstreams) {
-    const role = upstreamIndex === 0 ? "primary" : "fallback";
-    upstreamIndex += 1;
-    try {
-      const upstreamBody = await fetchUpstream(upstream, forwardedQuery);
-      const upstreamInfo = validateUpstreamResponse(upstreamBody, parsed);
-      if ((upstreamInfo.flags & 0x000f) === 2) {
-        logUpstreamFailure(group, role, { reason: "dns_servfail" });
-        continue;
+
+  // 主备都按“带 ECS”查一遍键再按“干净”查一遍；命中任一直接返回（改写 txid 回原查询）。
+  if (config.cacheMaxAgeS > 0) {
+    for (const upstream of upstreams) {
+      const selection = queryForUpstream(withEcsQuery, withoutEcsQuery, upstream);
+      const hit = await cacheLookup(cacheKeyFor(parsed, subnet, selection.withEcs));
+      if (hit !== null) {
+        writeU16(hit, 0, parsed.id);
+        return dnsResponse(hit);
       }
-      return dnsResponse(upstreamBody);
-    } catch (error) {
-      logUpstreamFailure(group, role, upstreamFailureDiagnostic(error));
-      // 仅在当前国内或国外组内尝试下一上游，不进行跨组回退。
     }
   }
-  return dnsResponse(buildDnsError(originalQuery, 2, parsed.question));
+
+  const primary = queryForUpstream(withEcsQuery, withoutEcsQuery, upstreams[0]!);
+  const fallback = queryForUpstream(withEcsQuery, withoutEcsQuery, upstreams[1]!);
+  const runPrimary = (): Promise<UpstreamSuccess | null> =>
+    tryUpstream(
+      upstreams[0]!,
+      primary.query,
+      primary.withEcs,
+      parsed,
+      group,
+      "primary",
+      config.upstreamTimeoutMs
+    );
+  const runFallback = (): Promise<UpstreamSuccess | null> =>
+    tryUpstream(
+      upstreams[1]!,
+      fallback.query,
+      fallback.withEcs,
+      parsed,
+      group,
+      "fallback",
+      config.upstreamTimeoutMs
+    );
+
+  let winner: UpstreamSuccess | null;
+  if (config.hedgeDelayMs === 0) {
+    // 双发：主备同时问，主用成功优先，否则取备。
+    const [first, second] = await Promise.all([runPrimary(), runFallback()]);
+    winner = first ?? second;
+  } else {
+    // 窗口内主用先成功 → 备用根本不发；主用慢 → 触发对冲，主备谁先成功用谁。
+    const primaryPromise = runPrimary();
+    const early: { tag: "hit"; r: UpstreamSuccess | null } | { tag: "timer" } =
+      await Promise.race([
+        primaryPromise.then((r) => ({ tag: "hit" as const, r })),
+        sleep(config.hedgeDelayMs).then(() => ({ tag: "timer" as const }))
+      ]);
+    if (early.tag === "hit") {
+      winner = early.r;
+      if (winner === null) winner = await runFallback();
+    } else {
+      const [p, f] = await Promise.all([primaryPromise, runFallback()]);
+      winner = p ?? f;
+    }
+  }
+
+  // 仅在当前国内或国外组内主备尝试，不进行跨组回退。
+  if (winner === null) {
+    return dnsResponse(buildDnsError(originalQuery, 2, parsed.question));
+  }
+  await cacheStore(
+    cacheKeyFor(parsed, subnet, winner.withEcs),
+    winner,
+    config.cacheMaxAgeS,
+    ctx
+  );
+  return dnsResponse(winner.body);
 }
 
-export async function handleRequest(request: Request, env: Env): Promise<Response> {
+export async function handleRequest(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext
+): Promise<Response> {
   let config: WorkerConfig;
   try {
     config = readConfig(env);
@@ -254,12 +470,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     return dnsResponse(buildDnsError(query, 2));
   }
-  return handleDns(request, env, config);
+  return handleDns(request, env, config, ctx);
 }
 
 export default {
-  fetch(request: Request, env: Env): Promise<Response> {
-    return handleRequest(request, env);
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return handleRequest(request, env, ctx);
   },
 
   scheduled(

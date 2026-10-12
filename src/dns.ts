@@ -43,6 +43,7 @@ export interface DnsMessageInfo {
   additionalCount: number;
   opt: ResourceRecord | null;
   optAdditionalIndex: number;
+  answers: ResourceRecord[];
 }
 
 function normalizedRuleLabel(label: Uint8Array): string | null {
@@ -190,8 +191,11 @@ export function parseDnsMessage(data: Uint8Array): DnsMessageInfo {
   const question = parseQuestion(data, DNS_HEADER_LENGTH);
   let offset = question.endOffset;
 
+  const answers: ResourceRecord[] = [];
   for (let i = 0; i < answerCount + authorityCount; i += 1) {
-    offset = parseRecord(data, offset).end;
+    const record = parseRecord(data, offset);
+    if (i < answerCount) answers.push(record);
+    offset = record.end;
   }
 
   let opt: ResourceRecord | null = null;
@@ -223,8 +227,19 @@ export function parseDnsMessage(data: Uint8Array): DnsMessageInfo {
     authorityCount,
     additionalCount,
     opt,
-    optAdditionalIndex
+    optAdditionalIndex,
+    answers
   };
+}
+
+/** answer 区最小 TTL（无 answer 返回 null，上游不缓存空回答）。 */
+export function minAnswerTtl(info: DnsMessageInfo): number | null {
+  if (info.answers.length === 0) return null;
+  let min = info.answers[0]?.ttl ?? 0;
+  for (const record of info.answers) {
+    if (record.ttl < min) min = record.ttl;
+  }
+  return min;
 }
 
 export function dnssecDo(info: DnsMessageInfo): boolean {
