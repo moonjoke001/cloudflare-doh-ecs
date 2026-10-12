@@ -68,7 +68,9 @@ def doh_post(doh, query, timeout=15):
     req = urllib.request.Request(
         doh, data=query,
         headers={"Content-Type": "application/dns-message",
-                 "Accept": "application/dns-message"},
+                 "Accept": "application/dns-message",
+                 # workers.dev 会拦 Python-urllib 默认 UA，伪装成常规客户端
+                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) clash-verge/2.3.3"},
         method="POST")
     t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as r:
