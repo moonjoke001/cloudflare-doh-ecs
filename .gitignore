@@ -5,3 +5,4 @@ dist/
 *.log
 manual-upload/
 *.tsbuildinfo
+node_modules/
