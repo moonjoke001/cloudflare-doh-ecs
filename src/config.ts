@@ -3,8 +3,8 @@ import type { Env } from "./types";
 
 const DEFAULT_DOMESTIC = "https://dns.alidns.com/dns-query";
 const DEFAULT_DOMESTIC_FALLBACK = "https://doh.pub/dns-query";
-const DEFAULT_GLOBAL = "https://dns.google/dns-query";
-const DEFAULT_GLOBAL_FALLBACK = "https://cloudflare-dns.com/dns-query";
+const DEFAULT_GLOBAL = "https://cloudflare-dns.com/dns-query";
+const DEFAULT_GLOBAL_FALLBACK = "https://dns.google/dns-query";
 const DEFAULT_PATH = "/doh";
 
 export type EcsScope = "on" | "off" | "cf-only";
@@ -108,11 +108,11 @@ export function readConfig(env: Env): WorkerConfig {
   const global: readonly [Upstream, Upstream] = [
     {
       url: validateUpstream(env.GLOBAL_DOH_URL, DEFAULT_GLOBAL),
-      ecs: parseEcsScope(env.GLOBAL_DOH_ECS, "off")
+      ecs: parseEcsScope(env.GLOBAL_DOH_ECS, "on")
     },
     {
       url: validateUpstream(env.GLOBAL_FALLBACK_DOH_URL, DEFAULT_GLOBAL_FALLBACK),
-      ecs: parseEcsScope(env.GLOBAL_FALLBACK_DOH_ECS, "on")
+      ecs: parseEcsScope(env.GLOBAL_FALLBACK_DOH_ECS, "off")
     }
   ];
   return {

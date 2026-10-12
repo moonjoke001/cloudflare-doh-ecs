@@ -12,8 +12,8 @@ describe("worker configuration", () => {
         { url: "https://doh.pub/dns-query", ecs: "on" }
       ],
       global: [
-        { url: "https://dns.google/dns-query", ecs: "off" },
-        { url: "https://cloudflare-dns.com/dns-query", ecs: "on" }
+        { url: "https://cloudflare-dns.com/dns-query", ecs: "on" },
+        { url: "https://dns.google/dns-query", ecs: "off" }
       ],
       upstreamTimeoutMs: 1500,
       hedgeDelayMs: 800,
@@ -34,7 +34,7 @@ describe("worker configuration", () => {
       path: "/private-doh",
       global: [
         { url: "https://resolver.example/dns-query", ecs: "cf-only" },
-        { url: "https://backup.example/dns-query", ecs: "on" }
+        { url: "https://backup.example/dns-query", ecs: "off" }
       ],
       upstreamTimeoutMs: 2000,
       hedgeDelayMs: 0,

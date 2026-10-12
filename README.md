@@ -13,7 +13,7 @@
 - 支持 RFC 8484 DoH GET 和 POST 请求
 - 国内域名使用 AliDNS，失败后回退腾讯 DNSPod
 - 其他域名使用 Google DNS，失败后回退 Cloudflare DNS
-- ECS 按上游独立控制：默认仅发往 Cloudflare（CDN 就近），Google 等拿干净查询
+- ECS 按上游独立控制：默认国外主用 Cloudflare 带 ECS（CDN 就近），备用 Google 拿干净查询
 - 主用慢时自动对冲备用（可配延迟），热点回答按 TTL 缓存
 - 国内域名规则通过 Workers KV 和 Cron Trigger 自动更新
 - 不记录完整查询域名和客户端 IP
@@ -37,7 +37,7 @@ https://<你的 Worker 域名>/doh
 | 分组 | 主上游 | 备用上游 |
 |---|---|---|
 | 国内域名 | AliDNS | 腾讯 DNSPod |
-| 其他域名 | Google DNS | Cloudflare DNS |
+| 其他域名 | Cloudflare DNS | Google DNS |
 
 主上游出现网络错误、超时、异常响应或 DNS `SERVFAIL` 时，才会尝试同组备用上游；不会在国内和国外分组之间回退。
 
@@ -48,8 +48,8 @@ ECS（EDNS Client Subnet）告诉上游客户端所在网段，让 CDN 返回就
 | 上游 | ECS | 原因 |
 |---|---|---|
 | 国内 AliDNS / 腾讯 | 带 | 就近 + 结果本来就是按国内视角算的 |
-| 国外 Google（主） | 不带 | 干净查询，不暴露客户端网段 |
-| 国外 Cloudflare（备） | 带 | CF 按 ECS 回 HK/JP 节点，否则回美国 |
+| 国外 Cloudflare（主） | 带 | CF 按 ECS 回 HK/JP 节点，否则回美国 |
+| 国外 Google（备） | 不带 | 干净查询，不暴露客户端网段 |
 
 每个上游可用 `<PREFIX>_ECS` 变量独立覆盖，取值为 `on`（恒带）、`off`（恒不带）、`cf-only`（仅 Cloudflare 上游带）。例如把国内备也关掉：`DOMESTIC_FALLBACK_DOH_ECS=off`。
 
@@ -68,11 +68,11 @@ ECS（EDNS Client Subnet）告诉上游客户端所在网段，让 CDN 返回就
 | `DOH_PATH` | `/doh` |
 | `DOMESTIC_DOH_URL` | `https://dns.alidns.com/dns-query` |
 | `DOMESTIC_FALLBACK_DOH_URL` | `https://doh.pub/dns-query` |
-| `GLOBAL_DOH_URL` | `https://dns.google/dns-query` |
-| `GLOBAL_FALLBACK_DOH_URL` | `https://cloudflare-dns.com/dns-query` |
+| `GLOBAL_DOH_URL` | `https://cloudflare-dns.com/dns-query` |
+| `GLOBAL_FALLBACK_DOH_URL` | `https://dns.google/dns-query` |
 | `DOMESTIC_DOH_ECS` / `DOMESTIC_FALLBACK_DOH_ECS` | `on` |
-| `GLOBAL_DOH_ECS` | `off` |
-| `GLOBAL_FALLBACK_DOH_ECS` | `on` |
+| `GLOBAL_DOH_ECS` | `on` |
+| `GLOBAL_FALLBACK_DOH_ECS` | `off` |
 | `UPSTREAM_TIMEOUT_MS` | `1500` |
 | `HEDGE_DELAY_MS` | `800` |
 | `CACHE_MAX_AGE_S` | `300` |

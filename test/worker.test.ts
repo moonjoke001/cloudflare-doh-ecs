@@ -73,7 +73,8 @@ describe("DoH worker", () => {
       vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
         calls += 1;
         const sent = new Uint8Array(init?.body as ArrayBuffer);
-        // 造一个带 A 记录 TTL=120 的回答（压缩指针指 question）。
+        // 真上游回干净回答：只取 question 段再拼 answer（带 ECS 查询尾部有 OPT，
+        // 直接 append 会被误解析成 answer，TTL=0 导致跳过缓存）。
         const parsed = parseDnsMessage(sent);
         const qEnd = parsed.question.endOffset;
         const answer = new Uint8Array(16);
@@ -84,11 +85,12 @@ describe("DoH worker", () => {
         writeU32(answer, 6, 120);
         writeU16(answer, 10, 4);
         answer.set([1, 2, 3, 4], 12);
-        const out = new Uint8Array(sent.length + answer.length);
-        out.set(sent);
-        out.set(answer, sent.length);
+        const out = new Uint8Array(qEnd + answer.length);
+        out.set(sent.slice(0, qEnd));
+        out.set(answer, qEnd);
         writeU16(out, 2, (parsed.flags & 0x7800) | 0x8180);
         writeU16(out, 6, 1);
+        writeU16(out, 10, 0);
         return new Response(toArrayBuffer(out), {
           headers: { "content-type": "application/dns-message" }
         });
@@ -171,19 +173,19 @@ describe("DoH worker", () => {
         },
         body: toArrayBuffer(makeQuery("example.net", 1))
       });
-    // global 组：主 Google(off)恒 503，备 CF(on)成功并按客户端 /24 缓存。
+    // global 组：主 CF(on)成功并按客户端 /24 缓存（mock 让 Google 恒 503 以防对冲走到它）。
     expect((await handleRequest(post("1.2.3.9"), env)).status).toBe(200);
-    expect(calls).toBe(2);
-    // 同一子网再查：备的 ecs 键命中，不再出网。
+    expect(calls).toBe(1);
+    // 同一子网再查：主的 ecs 键命中，不再出网。
     expect((await handleRequest(post("1.2.3.200"), env)).status).toBe(200);
-    expect(calls).toBe(2);
+    expect(calls).toBe(1);
     // 不同子网：ecs 键隔离，miss 后重新出网并写入第二条。
     expect((await handleRequest(post("9.9.9.9"), env)).status).toBe(200);
-    expect(calls).toBe(4);
+    expect(calls).toBe(2);
     expect(cache.size).toBe(2);
   });
 
-  it("routes foreign GET to Google and supports base64url", async () => {
+  it("routes foreign GET to Cloudflare and supports base64url", async () => {
     const { env } = await envWithRules();
     const destinations: string[] = [];
     vi.stubGlobal(
@@ -204,7 +206,7 @@ describe("DoH worker", () => {
       env
     );
     expect(response.status).toBe(200);
-    expect(destinations).toEqual(["https://dns.google/dns-query"]);
+    expect(destinations).toEqual(["https://cloudflare-dns.com/dns-query"]);
   });
 
   function ecsBytes(body: Uint8Array): number[] | null {
@@ -248,14 +250,14 @@ describe("DoH worker", () => {
       env
     );
     expect(response.status).toBe(200);
-    // 主用 Google 默认不带 ECS（干净原版）。
-    expect(seen[0]?.url).toBe("https://dns.google/dns-query");
-    expect(ecsBytes(seen[0]?.body ?? new Uint8Array())).toBeNull();
-    // 备 Cloudflare 默认带 ECS，IP 取自 cf-connecting-ip。
-    expect(seen[1]?.url).toBe("https://cloudflare-dns.com/dns-query");
-    expect(ecsBytes(seen[1]?.body ?? new Uint8Array())).toEqual([
+    // 主用 Cloudflare 默认带 ECS，IP 取自 cf-connecting-ip。
+    expect(seen[0]?.url).toBe("https://cloudflare-dns.com/dns-query");
+    expect(ecsBytes(seen[0]?.body ?? new Uint8Array())).toEqual([
       0, 8, 0, 7, 0, 1, 24, 0, 8, 8, 4
     ]);
+    // 备 Google 默认不带 ECS（干净原版）。
+    expect(seen[1]?.url).toBe("https://dns.google/dns-query");
+    expect(ecsBytes(seen[1]?.body ?? new Uint8Array())).toBeNull();
   });
 
   it("sends ECS to domestic primary and strips it for opt-out fallback", async () => {
@@ -372,7 +374,7 @@ describe("DoH worker", () => {
     });
   });
 
-  it("falls back from Google to Cloudflare without crossing groups", async () => {
+  it("falls back from Cloudflare to Google without crossing groups", async () => {
     const { env } = await envWithRules();
     const calls: string[] = [];
     vi.stubGlobal(
@@ -395,8 +397,8 @@ describe("DoH worker", () => {
       env
     );
     expect(calls).toEqual([
-      "https://dns.google/dns-query",
-      "https://cloudflare-dns.com/dns-query"
+      "https://cloudflare-dns.com/dns-query",
+      "https://dns.google/dns-query"
     ]);
     expect(console.warn).toHaveBeenCalledWith("doh_upstream_failed", {
       group: "global",
