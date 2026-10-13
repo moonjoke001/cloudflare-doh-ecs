@@ -3,7 +3,10 @@
   "name": "cloudflare-doh-ecs",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-27",
-  "workers_dev": true,
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "doh.lalayunssl.xyz/*", "zone_name": "lalayunssl.xyz" }
+  ],
   "kv_namespaces": [
     {
       "binding": "RULES_KV"
