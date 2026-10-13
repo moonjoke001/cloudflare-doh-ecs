@@ -64,6 +64,16 @@ def parse_answers(body):
     return out
 
 
+_PROXY = None  # 全局：--proxy 传入后所有请求（含 geo）都走它
+
+
+def _opener():
+    if _PROXY is None:
+        return urllib.request.build_opener()
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": _PROXY, "https": _PROXY}))
+
+
 def doh_post(doh, query, timeout=15):
     req = urllib.request.Request(
         doh, data=query,
@@ -73,15 +83,15 @@ def doh_post(doh, query, timeout=15):
                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) clash-verge/2.3.3"},
         method="POST")
     t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _opener().open(req, timeout=timeout) as r:
         body = r.read()
     return body, (time.monotonic() - t0) * 1000
 
 
 def geo(ip):
     try:
-        with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=countryCode,org",
-                                    timeout=10) as r:
+        with _opener().open(f"http://ip-api.com/json/{ip}?fields=countryCode,org",
+                            timeout=10) as r:
             return json.load(r)
     except Exception as e:
         return {"countryCode": "?", "org": f"geo-fail:{e}"}
@@ -91,7 +101,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--doh", default="http://127.0.0.1:8787/doh")
     ap.add_argument("--no-geo", action="store_true", help="跳过归属地查询（无 TUN 直连时 ip-api 可能够不着）")
+    ap.add_argument("--proxy", default=None,
+                    help="经 mihomo 代理访问 DoH，如 http://127.0.0.1:7897（本地 DNS 被 fake-ip 接管时用）")
     args = ap.parse_args()
+    global _PROXY
+    _PROXY = args.proxy
 
     ok = True
     for name in DOMAINS:
