@@ -9,7 +9,8 @@
   ],
   "kv_namespaces": [
     {
-      "binding": "RULES_KV"
+      "binding": "RULES_KV",
+      "id": "724104fe6ac049cc9e4996b6f53446d7"
     }
   ],
   "vars": {
@@ -24,7 +25,8 @@
     "GLOBAL_FALLBACK_DOH_ECS": "off",
     "UPSTREAM_TIMEOUT_MS": "1500",
     "HEDGE_DELAY_MS": "800",
-    "CACHE_MAX_AGE_S": "300"
+    "CACHE_MAX_AGE_S": "300",
+    "DEBUG_HEADERS": "on"
   },
   "triggers": {
     "crons": ["17 3 * * *"]

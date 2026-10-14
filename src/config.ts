@@ -21,6 +21,7 @@ export interface WorkerConfig {
   upstreamTimeoutMs: number;
   hedgeDelayMs: number;
   cacheMaxAgeS: number;
+  debugHeaders: boolean;
   // 兼容旧配置：保留纯 URL 数组供外部引用。
   domesticUrls: readonly [string, string];
   globalUrls: readonly [string, string];
@@ -122,6 +123,7 @@ export function readConfig(env: Env): WorkerConfig {
     upstreamTimeoutMs: parseBoundedInt(env.UPSTREAM_TIMEOUT_MS, 1500, 200, 10000, "invalid_timeout"),
     hedgeDelayMs: parseBoundedInt(env.HEDGE_DELAY_MS, 800, 0, 5000, "invalid_hedge_delay"),
     cacheMaxAgeS: parseBoundedInt(env.CACHE_MAX_AGE_S, 300, 0, 86400, "invalid_cache_age"),
+    debugHeaders: env.DEBUG_HEADERS === "on",
     domesticUrls: [domestic[0].url, domestic[1].url],
     globalUrls: [global[0].url, global[1].url]
   };

@@ -17,6 +17,8 @@ export interface Env {
   HEDGE_DELAY_MS?: string;
   // 热点缓存上限秒（默认 300，0 = 关闭）。
   CACHE_MAX_AGE_S?: string;
+  // "on" 时响应带 x-doh-debug 头（分流决策/规则版本），排查线上用。
+  DEBUG_HEADERS?: string;
 }
 
 export interface RuleManifest {

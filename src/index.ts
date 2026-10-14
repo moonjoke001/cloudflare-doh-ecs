@@ -14,7 +14,12 @@ import {
   subnetForEcs,
   type EcsSubnet
 } from "./ip";
-import { ensureRules, isDomesticDomain, updateRules } from "./rules";
+import {
+  ensureRules,
+  isDomesticDomain,
+  updateRules,
+  type LoadedRules
+} from "./rules";
 import { readConfig, type Upstream, type WorkerConfig } from "./config";
 import type { Env } from "./types";
 
@@ -77,15 +82,22 @@ function emptyResponse(status: number, extraHeaders?: HeadersInit): Response {
   return new Response(null, { status, headers });
 }
 
-function dnsResponse(body: Uint8Array, status = 200): Response {
-  return new Response(toArrayBuffer(body), {
-    status,
-    headers: {
-      "Content-Type": DNS_CONTENT_TYPE,
-      "Cache-Control": "no-store",
-      "X-Content-Type-Options": "nosniff"
-    }
+function dnsResponse(
+  body: Uint8Array,
+  status = 200,
+  extraHeaders?: HeadersInit
+): Response {
+  const headers = new Headers({
+    "Content-Type": DNS_CONTENT_TYPE,
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
   });
+  if (extraHeaders !== undefined) {
+    for (const [key, value] of new Headers(extraHeaders).entries()) {
+      headers.set(key, value);
+    }
+  }
+  return new Response(toArrayBuffer(body), { status, headers });
 }
 
 function contentTypeIsDns(request: Request): boolean {
@@ -239,6 +251,8 @@ interface UpstreamSuccess {
   body: Uint8Array;
   info: DnsMessageInfo;
   withEcs: boolean;
+  role: "primary" | "fallback";
+  upstreamHost: string;
 }
 
 async function tryUpstream(
@@ -257,7 +271,13 @@ async function tryUpstream(
       logUpstreamFailure(group, role, { reason: "dns_servfail" });
       return null;
     }
-    return { body, info, withEcs };
+    return {
+      body,
+      info,
+      withEcs,
+      role,
+      upstreamHost: new URL(upstream.url).hostname
+    };
   } catch (error) {
     logUpstreamFailure(group, role, upstreamFailureDiagnostic(error));
     return null;
@@ -334,6 +354,38 @@ async function cacheStore(
   }
 }
 
+/** 调试头：DECIDO 开启时回带分流决策，便于线上排查。 */
+function debugHeaders(
+  config: WorkerConfig,
+  env: Env,
+  parts: {
+    group?: string;
+    domestic?: boolean;
+    rulesVersion?: string | null;
+    cache?: string;
+    subnet?: string | null;
+    upstream?: string;
+  }
+): HeadersInit | undefined {
+  if (config.debugHeaders !== true) return undefined;
+  const bits = [
+    parts.cache !== undefined ? `cache=${parts.cache}` : null,
+    parts.group !== undefined ? `group=${parts.group}` : null,
+    parts.domestic !== undefined ? `domestic=${parts.domestic}` : null,
+    parts.rulesVersion !== undefined
+      ? `rules=${parts.rulesVersion === null ? "none" : parts.rulesVersion.slice(11, 19)}`
+      : null,
+    parts.subnet !== undefined ? `ecs=${parts.subnet ?? "none"}` : null,
+    parts.upstream !== undefined ? `up=${parts.upstream}` : null
+  ].filter((v): v is string => v !== null);
+  return { "x-doh-debug": bits.join(" ") };
+}
+
+function subnetLabel(subnet: EcsSubnet | null): string {
+  if (subnet === null) return "none";
+  return `${[...subnet.network].join(".")}/${subnet.prefixLength}`;
+}
+
 async function handleDns(
   request: Request,
   env: Env,
@@ -369,9 +421,10 @@ async function handleDns(
   }
 
   let domestic = false;
+  let rules: LoadedRules | null = null;
   const ruleName = parsed.question.name.ruleName;
   if (ruleName !== null) {
-    const rules = await ensureRules(env);
+    rules = await ensureRules(env);
     domestic = rules !== null && isDomesticDomain(rules, ruleName);
   }
   const upstreams = domestic ? config.domestic : config.global;
@@ -384,7 +437,17 @@ async function handleDns(
       const hit = await cacheLookup(cacheKeyFor(parsed, subnet, selection.withEcs));
       if (hit !== null) {
         writeU16(hit, 0, parsed.id);
-        return dnsResponse(hit);
+        return dnsResponse(
+          hit,
+          200,
+          debugHeaders(config, env, {
+            cache: "hit",
+            group,
+            domestic,
+            rulesVersion: rules?.version ?? null,
+            subnet: subnetLabel(subnet)
+          })
+        );
       }
     }
   }
@@ -444,7 +507,19 @@ async function handleDns(
     config.cacheMaxAgeS,
     ctx
   );
-  return dnsResponse(winner.body);
+  const winnerRole = winner.role;
+  return dnsResponse(
+    winner.body,
+    200,
+    debugHeaders(config, env, {
+      cache: `miss/${winnerRole}`,
+      group,
+      domestic,
+      rulesVersion: rules?.version ?? null,
+      subnet: subnetLabel(subnet),
+      upstream: winner.upstreamHost
+    })
+  );
 }
 
 export async function handleRequest(
