@@ -738,7 +738,12 @@ async function handleDns(
       return dnsResponse(buildRelayEmptyAnswer(originalQuery, parsed), 200, relayDebug);
     }
     if (parsed.question.type === HTTPS_TYPE) {
-      const echValue = await getSharedEchConfig(config);
+      // x.com 这类企业客户的 ECH config 与 CF 公共钥匙不同，必须用专用钥匙；
+      // 其余中继域（chatgpt/grok）用 cloudflare-ech.com 的公共钥匙。
+      const echValue =
+        matchRelayDomain(config.xDomains, ruleName) !== null
+          ? await resolveEchKey(env, config, "echcfg:x", config.xEchConfig)
+          : await getSharedEchConfig(config);
       if (echValue !== null) {
         return dnsResponse(buildRelayHttpsAnswer(originalQuery, parsed, echValue), 200, relayDebug);
       }

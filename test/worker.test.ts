@@ -630,6 +630,29 @@ describe("DoH worker", () => {
       ]);
     });
 
+    it("synthesizes x.com relay HTTPS with the dedicated key, not the shared one", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 503 })));
+      const { env } = await envWithRules();
+      const response = await handleRequest(
+        new Request("https://worker.example/doh", {
+          method: "POST",
+          headers: {
+            "content-type": "application/dns-message",
+            "x-forwarded-for": "1.2.3.9"
+          },
+          body: toArrayBuffer(makeQuery("x.com", 65))
+        }),
+        { ...env, ...relayEnv, RELAY_DOMAINS: "chatgpt.com,grok.com,x.com", X_DOMAINS: "x.com", X_ECH_CONFIG_B64: btoa(String.fromCharCode(...new Uint8Array([0xa1, 0x00, 0x42, 0x78]))) }
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-doh-debug")).toContain("up=relay");
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(Array.from(svcbGetEch(body, info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd) ?? [])).toEqual([
+        0xa1, 0x00, 0x42, 0x78
+      ]);
+    });
+
     it("leaves non-relay domains untouched", async () => {
       const destinations: string[] = [];
       vi.stubGlobal(

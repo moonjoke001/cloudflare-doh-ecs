@@ -27,7 +27,7 @@
     "HEDGE_DELAY_MS": "800",
     "CACHE_MAX_AGE_S": "300",
     "DEBUG_HEADERS": "on",
-    "RELAY_DOMAINS": "chatgpt.com,grok.com",
+    "RELAY_DOMAINS": "chatgpt.com,grok.com,x.com",
     "RELAY_IPV4": "199.168.138.132",
     "X_DOMAINS": "x.com",
     "X_ECH_CONFIG_B64": "AEX+DQBB1QAgACDHrss4Ckg/waeLaVKv5BDPKDQBB6Wme2+a2+FFHi8eVwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
