@@ -1,9 +1,10 @@
-import { toArrayBuffer, writeU16 } from "./binary";
+import { toArrayBuffer, readU16, writeU16 } from "./binary";
 import {
   buildDnsError,
   DnsFormatError,
   minAnswerTtl,
   parseDnsMessage,
+  parseName,
   validateUpstreamResponse,
   type DnsMessageInfo
 } from "./dns";
@@ -267,8 +268,13 @@ async function tryUpstream(
   try {
     const body = await fetchUpstream(upstream.url, query, timeoutMs);
     const info = validateUpstreamResponse(body, parsed);
-    if ((info.flags & 0x000f) === 2) {
-      logUpstreamFailure(group, role, { reason: "dns_servfail" });
+    // 仅 NOERROR(0)/NXDOMAIN(3) 算合法结论：REFUSED/NOTIMP 等是“没答”，
+    // 不能让它在竞速里抢先，堵死备胎给出真答案的机会。
+    const rcode = info.flags & 0x000f;
+    if (rcode !== 0 && rcode !== 3) {
+      logUpstreamFailure(group, role, {
+        reason: rcode === 2 ? "dns_servfail" : `dns_rcode_${rcode}`
+      });
       return null;
     }
     return {
@@ -365,6 +371,7 @@ function debugHeaders(
     cache?: string;
     subnet?: string | null;
     upstream?: string;
+    ech?: string;
   }
 ): HeadersInit | undefined {
   if (config.debugHeaders !== true) return undefined;
@@ -376,7 +383,8 @@ function debugHeaders(
       ? `rules=${parts.rulesVersion === null ? "none" : parts.rulesVersion.slice(11, 19)}`
       : null,
     parts.subnet !== undefined ? `ecs=${parts.subnet ?? "none"}` : null,
-    parts.upstream !== undefined ? `up=${parts.upstream}` : null
+    parts.upstream !== undefined ? `up=${parts.upstream}` : null,
+    parts.ech !== undefined ? `ech=${parts.ech}` : null
   ].filter((v): v is string => v !== null);
   return { "x-doh-debug": bits.join(" ") };
 }
@@ -384,6 +392,65 @@ function debugHeaders(
 function subnetLabel(subnet: EcsSubnet | null): string {
   if (subnet === null) return "none";
   return `${[...subnet.network].join(".")}/${subnet.prefixLength}`;
+}
+
+const SVCB_ECH_KEY = 5;
+const HTTPS_TYPE = 65;
+
+/**
+ * 扫描 SVCB/HTTPS rdata 的参数区，判断是否带 ech（SvcParamKey=5）。
+ * rdata 布局：priority(2) + target(name) + (key(2)+len(2)+value)*。
+ */
+export function svcbHasEch(data: Uint8Array, start: number, end: number): boolean {
+  if (start + 2 > end) return false;
+  let cursor = start + 2; // 跳过 priority
+  try {
+    const target = parseName(data, cursor);
+    cursor = target.nextOffset;
+  } catch {
+    return false;
+  }
+  while (cursor + 4 <= end) {
+    const key = readU16(data, cursor);
+    const length = readU16(data, cursor + 2);
+    if (cursor + 4 + length > end) return false;
+    if (key === SVCB_ECH_KEY) return true;
+    cursor += 4 + length;
+  }
+  return false;
+}
+
+function answerHasEch(body: Uint8Array, info: DnsMessageInfo): boolean {
+  return info.answers.some(
+    (record) => record.type === HTTPS_TYPE && svcbHasEch(body, record.rdataStart, record.rdataEnd)
+  );
+}
+
+/**
+ * HTTPS(65) 查询且上游答案没带 ech 时，向 Cloudflare 官方解析器补查同一条
+ * HTTPS 记录：CF 托管站若开了 ECH，官方解析器的答案里一定带 ech 配置。
+ * 拿到带 ech 的答案就整体替换返回（同一权威数据），拿不到维持原答案。
+ * 仅对全球组启用：国内域名单独多打一发查询不划算，且 CF 站点极少命中。
+ */
+async function maybeUpgradeEch(
+  cleanQuery: Uint8Array,
+  winner: UpstreamSuccess,
+  parsed: DnsMessageInfo,
+  config: WorkerConfig,
+  group: "domestic" | "global"
+): Promise<Uint8Array | null> {
+  if (parsed.question.type !== HTTPS_TYPE || group !== "global") return null;
+  if (answerHasEch(winner.body, winner.info)) return null;
+  try {
+    const body = await fetchUpstream(config.global[0]!.url, cleanQuery, config.upstreamTimeoutMs);
+    const info = validateUpstreamResponse(body, parsed);
+    const rcode = info.flags & 0x000f;
+    if (rcode !== 0 && rcode !== 3) return null;
+    if (!answerHasEch(body, info)) return null;
+    return body;
+  } catch {
+    return null;
+  }
 }
 
 async function handleDns(
@@ -501,23 +568,34 @@ async function handleDns(
   if (winner === null) {
     return dnsResponse(buildDnsError(originalQuery, 2, parsed.question));
   }
+
+  // HTTPS 查询且全球组答案缺 ech 时用 CF 官方解析器补齐；升级后连同最终
+  // 报文一起进缓存，避免“首查带 ECH、缓存命中后丢失”。
+  const echBody = await maybeUpgradeEch(withoutEcsQuery, winner, parsed, config, group);
+  const finalBody = echBody ?? winner.body;
+  if (echBody !== null) {
+    winner = { ...winner, body: finalBody };
+  }
+
   await cacheStore(
     cacheKeyFor(parsed, subnet, winner.withEcs),
     winner,
     config.cacheMaxAgeS,
     ctx
   );
-  const winnerRole = winner.role;
   return dnsResponse(
-    winner.body,
+    finalBody,
     200,
     debugHeaders(config, env, {
-      cache: `miss/${winnerRole}`,
+      cache: `miss/${winner.role}`,
       group,
       domestic,
       rulesVersion: rules?.version ?? null,
       subnet: subnetLabel(subnet),
-      upstream: winner.upstreamHost
+      upstream: winner.upstreamHost,
+      ...(parsed.question.type === HTTPS_TYPE
+        ? { ech: echBody !== null ? "on" : "off" }
+        : {})
     })
   );
 }

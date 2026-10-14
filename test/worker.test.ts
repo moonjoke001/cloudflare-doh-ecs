@@ -206,7 +206,11 @@ describe("DoH worker", () => {
       env
     );
     expect(response.status).toBe(200);
-    expect(destinations).toEqual(["https://cloudflare-dns.com/dns-query"]);
+    // type-65 且答案缺 ech 时会向 CF 官方解析器补查一次（仍无 ech 则返回原答案）。
+    expect(destinations).toEqual([
+      "https://cloudflare-dns.com/dns-query",
+      "https://cloudflare-dns.com/dns-query"
+    ]);
   });
 
   function ecsBytes(body: Uint8Array): number[] | null {
