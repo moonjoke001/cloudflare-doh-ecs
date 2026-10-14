@@ -26,6 +26,12 @@ export interface WorkerConfig {
   // AI 中继：命中域名的 A/HTTPS 改指自建 TCP 中继，其余解析不受影响。
   relayDomains: readonly string[];
   relayIpv4: Uint8Array | null;
+  // ECH 增强：x.com 类双 CDN 站统指 CF + 专用公钥；Meta 系列注入内置公钥。
+  xDomains: readonly string[];
+  xEchConfig: Uint8Array | null;
+  metaDomains: readonly string[];
+  metaEchConfig: Uint8Array | null;
+  echSyncUrl: string | null;
   // 兼容旧配置：保留纯 URL 数组供外部引用。
   domesticUrls: readonly [string, string];
   globalUrls: readonly [string, string];
@@ -93,6 +99,27 @@ function parseRelayIpv4(value: string | undefined): Uint8Array | null {
   return parsed.bytes;
 }
 
+/** base64 ECH config → 字节；未设置返回 null，设置了但解不开是配置错误。 */
+function parseEchConfigB64(value: string | undefined): Uint8Array | null {
+  if (value === undefined || value.trim() === "") return null;
+  try {
+    const raw = atob(value.trim());
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
+    if (bytes.length === 0) throw new Error("empty");
+    return bytes;
+  } catch {
+    throw new Error("invalid_ech_config");
+  }
+}
+
+function parseSyncUrl(value: string | undefined): string | null {
+  if (value === undefined || value.trim() === "") return null;
+  const url = new URL(value.trim());
+  if (url.protocol !== "https:") throw new Error("invalid_ech_sync_url");
+  return url.toString();
+}
+
 function parseBoundedInt(
   value: string | undefined,
   fallback: number,
@@ -139,6 +166,11 @@ export function readConfig(env: Env): WorkerConfig {
     debugHeaders: env.DEBUG_HEADERS === "on",
     relayDomains: parseRelayDomains(env.RELAY_DOMAINS),
     relayIpv4: parseRelayIpv4(env.RELAY_IPV4),
+    xDomains: parseRelayDomains(env.X_DOMAINS),
+    xEchConfig: parseEchConfigB64(env.X_ECH_CONFIG_B64),
+    metaDomains: parseRelayDomains(env.META_DOMAINS),
+    metaEchConfig: parseEchConfigB64(env.META_ECH_CONFIG_B64),
+    echSyncUrl: parseSyncUrl(env.ECH_SYNC_URL),
     domesticUrls: [domestic[0].url, domestic[1].url],
     globalUrls: [global[0].url, global[1].url]
   };

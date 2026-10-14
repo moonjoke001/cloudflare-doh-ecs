@@ -33,6 +33,7 @@ import {
   TYPE_AAAA
 } from "./ech";
 import {
+  buildPinnedAAnswer,
   buildRelayAAnswer,
   buildRelayEmptyAnswer,
   buildRelayHttpsAnswer,
@@ -487,6 +488,192 @@ async function maybeUpgradeEch(
   }
 }
 
+// ---------------------------------------------------------------------------
+// ECH 增强：双 CDN 大站统指（x.com）+ 不发布公钥站的内置公钥注入（Meta 系列）。
+// 原理参考 1molchuan/edge-smart-doh（AGPL-3.0）：
+// - x.com 同时在 Cloudflare 与不支持 ECH 的 CDN 间摆动，国内解析常分到后者。
+//   <域>.cdn.cloudflare.net 是 Cloudflare 官方确认名：它有 A 记录即当前由 CF
+//   服务。此时把 A 钉到确认 IP（AAAA 压空——X 对 IPv6 一律 403），HTTPS 合成
+//   带 x.com 专用公钥的记录（public_name 仍是 cloudflare-ech.com）。CF 不在
+//   服务时原样放行，绝不把用户指到不服务它的地址上。
+// - Meta 系列服务器支持 ECH 却从不在 DNS 发布公钥，内置后直接 upsert 进官方
+//   HTTPS 答案（A/AAAA 不动——地址本来就直连可达，目的只是隐藏 SNI）。
+// 公钥可通过 ECH_SYNC_URL 指向上游实例定时同步进 KV（换钥跟踪），KV 值优先
+// 于内置值；上游实例也拿不到时维持内置值，最终退化为原样解析，不会弄坏站点。
+// ---------------------------------------------------------------------------
+
+const CF_CONFIRM_TTL_MS = 5 * 60 * 1000;
+const ECH_OVERRIDE_TTL_MS = 5 * 60 * 1000;
+
+const cfConfirmCache = new Map<string, { addresses: Uint8Array[] | null; expiresAt: number }>();
+const echOverrideCache = new Map<string, { value: Uint8Array | null; expiresAt: number }>();
+
+export function resetEchEnhanceCachesForTest(): void {
+  cfConfirmCache.clear();
+  echOverrideCache.clear();
+}
+
+/** <name>.cdn.cloudflare.net 的 A 记录列表；无答案（非 CF 服务）返回 null。 */
+async function cfConfirmedAddresses(
+  name: string,
+  config: WorkerConfig
+): Promise<Uint8Array[] | null> {
+  const cached = cfConfirmCache.get(name);
+  const now = Date.now();
+  if (cached !== undefined && now < cached.expiresAt) return cached.addresses;
+  let addresses: Uint8Array[] | null = null;
+  try {
+    const query = buildQuery(`${name}.cdn.cloudflare.net`, TYPE_A);
+    const body = await fetchUpstream(config.global[0]!.url, query, config.upstreamTimeoutMs);
+    const info = parseDnsMessage(body);
+    if ((info.flags & 0x000f) === 0) {
+      addresses = info.answers.filter((record) => record.type === TYPE_A).map((record) => {
+        const length = record.rdataEnd - record.rdataStart;
+        if (length !== 4) throw new DnsFormatError("unexpected_a_length");
+        return body.slice(record.rdataStart, record.rdataEnd);
+      });
+    }
+  } catch {
+    addresses = null;
+  }
+  cfConfirmCache.set(name, { addresses, expiresAt: now + CF_CONFIRM_TTL_MS });
+  return addresses;
+}
+
+/** KV 覆盖值优先于内置公钥；读失败/未写用内置。进程内缓存 5 分钟。 */
+async function resolveEchKey(
+  env: Env,
+  config: WorkerConfig,
+  kvKey: string,
+  builtin: Uint8Array | null
+): Promise<Uint8Array | null> {
+  const cached = echOverrideCache.get(kvKey);
+  const now = Date.now();
+  if (cached !== undefined && now < cached.expiresAt) {
+    return cached.value ?? builtin;
+  }
+  let override: Uint8Array | null = null;
+  try {
+    const stored = await env.RULES_KV.get(kvKey, "text");
+    if (stored !== null && stored !== "") {
+      const raw = atob(stored);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
+      override = bytes;
+    }
+  } catch {
+    override = null;
+  }
+  echOverrideCache.set(kvKey, { value: override, expiresAt: now + ECH_OVERRIDE_TTL_MS });
+  return override ?? builtin;
+}
+
+/**
+ * x.com 类：A 钉 CF 确认地址、AAAA 压空、HTTPS 合成/补专用公钥。
+ * 任一步失败返回 null 落回普通解析——增强失败绝不能弄坏解析。
+ */
+async function handleXDomain(
+  query: Uint8Array,
+  parsed: DnsMessageInfo,
+  config: WorkerConfig,
+  env: Env
+): Promise<Uint8Array | null> {
+  const type = parsed.question.type;
+  if (type === TYPE_AAAA) return buildRelayEmptyAnswer(query, parsed);
+  if (type !== TYPE_A && type !== HTTPS_TYPE) return null;
+  const xKey = await resolveEchKey(env, config, "echcfg:x", config.xEchConfig);
+  if (type === TYPE_A) {
+    // 地址只依赖 CF 确认名，公钥缺失不影响 A 答案的正确性。
+    const addresses = await cfConfirmedAddresses(parsed.question.name.ruleName ?? "", config);
+    if (addresses === null || addresses.length === 0) return null;
+    return buildPinnedAAnswer(query, parsed, addresses);
+  }
+  if (xKey === null) return null;
+  try {
+    const body = await fetchUpstream(config.global[0]!.url, query, config.upstreamTimeoutMs);
+    const info = validateUpstreamResponse(body, parsed);
+    const rcode = info.flags & 0x000f;
+    if (rcode !== 0 && rcode !== 3) return null;
+    if (answerHasEch(body, info)) return body;
+    if (hasHttpsAnswer(info)) return spliceEchIntoAnswers(body, info, xKey);
+    // 官方连 HTTPS 记录都不给 → 合成 alpn=h2 + 专用公钥的 ServiceMode 记录。
+    return buildRelayHttpsAnswer(query, parsed, xKey);
+  } catch {
+    return null;
+  }
+}
+
+/** Meta 系列：仅 HTTPS 查询 upsert 内置公钥；官方没有 HTTPS 记录时不合成。 */
+async function handleMetaHttps(
+  query: Uint8Array,
+  parsed: DnsMessageInfo,
+  config: WorkerConfig,
+  env: Env
+): Promise<Uint8Array | null> {
+  if (parsed.question.type !== HTTPS_TYPE) return null;
+  const metaKey = await resolveEchKey(env, config, "echcfg:meta", config.metaEchConfig);
+  if (metaKey === null) return null;
+  try {
+    const body = await fetchUpstream(config.global[0]!.url, query, config.upstreamTimeoutMs);
+    const info = validateUpstreamResponse(body, parsed);
+    const rcode = info.flags & 0x000f;
+    if (rcode !== 0 && rcode !== 3) return null;
+    if (!hasHttpsAnswer(info)) return null;
+    if (answerHasEch(body, info)) return body;
+    return spliceEchIntoAnswers(body, info, metaKey);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 换钥跟踪：从参考实例（自带探测机）拉两个公钥，与内置值不同则写 KV。
+ * 参考实例不可达时静默跳过——KV 里旧值仍在，最坏是钥匙过期后客户端
+ * 自动回退明文连接，不会断站。
+ */
+export async function syncEchKeys(env: Env, config: WorkerConfig): Promise<void> {
+  if (config.echSyncUrl === null) return;
+  const pull = async (name: string): Promise<Uint8Array | null> => {
+    const query = buildQuery(name, HTTPS_TYPE);
+    const encoded = btoa(String.fromCharCode(...query))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    const response = await fetch(`${config.echSyncUrl}?dns=${encoded}`, {
+      headers: { Accept: "application/dns-message" }
+    });
+    if (!response.ok) throw new Error(`sync_http_${response.status}`);
+    const body = new Uint8Array(await response.arrayBuffer());
+    const info = parseDnsMessage(body);
+    if ((info.flags & 0x000f) !== 0) return null;
+    return firstEchValue(body, info);
+  };
+  const targets: Array<{ name: string; kvKey: string; builtin: Uint8Array | null }> = [
+    { name: "x.com", kvKey: "echcfg:x", builtin: config.xEchConfig },
+    { name: "instagram.com", kvKey: "echcfg:meta", builtin: config.metaEchConfig }
+  ];
+  for (const target of targets) {
+    try {
+      const fresh = await pull(target.name);
+      if (fresh === null) continue;
+      const builtin = target.builtin;
+      const unchanged =
+        builtin !== null &&
+        builtin.length === fresh.length &&
+        builtin.every((byte, index) => byte === fresh[index]);
+      if (unchanged) continue;
+      const stored = await env.RULES_KV.get(target.kvKey, "text");
+      const encoded = btoa(String.fromCharCode(...fresh));
+      if (stored !== encoded) {
+        await env.RULES_KV.put(target.kvKey, encoded);
+        echOverrideCache.delete(target.kvKey);
+      }
+    } catch {
+      // 单个公钥同步失败不影响另一个。
+    }
+  }
+}
+
 async function handleDns(
   request: Request,
   env: Env,
@@ -555,6 +742,28 @@ async function handleDns(
       if (echValue !== null) {
         return dnsResponse(buildRelayHttpsAnswer(originalQuery, parsed, echValue), 200, relayDebug);
       }
+    }
+  }
+
+  // ECH 增强：x.com 双 CDN 统指 + Meta 系列公钥注入。返回 null = 不归它们管，
+  // 落回普通解析。仅全球组：国内域名与 CF/Meta 的 ECH 无交集。
+  if (!domestic) {
+    const enhanceDebug = () =>
+      debugHeaders(config, env, {
+        cache: "miss/echdom",
+        group,
+        domestic,
+        rulesVersion: rules?.version ?? null,
+        subnet: subnetLabel(subnet),
+        upstream: "ech-enhance"
+      });
+    if (matchRelayDomain(config.xDomains, ruleName) !== null) {
+      const enhanced = await handleXDomain(originalQuery, parsed, config, env);
+      if (enhanced !== null) return dnsResponse(enhanced, 200, enhanceDebug());
+    }
+    if (matchRelayDomain(config.metaDomains, ruleName) !== null) {
+      const enhanced = await handleMetaHttps(originalQuery, parsed, config, env);
+      if (enhanced !== null) return dnsResponse(enhanced, 200, enhanceDebug());
     }
   }
 
@@ -698,7 +907,11 @@ export default {
     ctx: ExecutionContext
   ): void {
     ctx.waitUntil(
-      updateRules(env).then(
+      Promise.all([
+        updateRules(env),
+        // 延迟到 then 里解析配置：配置错误只影响公钥同步，不连累规则刷新。
+        Promise.resolve().then(() => syncEchKeys(env, readConfig(env)))
+      ]).then(
         () => undefined,
         () => undefined
       )

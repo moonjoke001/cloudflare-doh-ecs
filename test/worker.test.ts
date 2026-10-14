@@ -1,7 +1,13 @@
 import { concatBytes, readU16, toArrayBuffer, writeU16, writeU32 } from "../src/binary";
 import { parseDnsMessage } from "../src/dns";
 import { svcbGetEch } from "../src/ech";
-import { handleRequest, resetSharedEchCacheForTest } from "../src/index";
+import {
+  handleRequest,
+  resetEchEnhanceCachesForTest,
+  resetSharedEchCacheForTest,
+  syncEchKeys
+} from "../src/index";
+import { readConfig } from "../src/config";
 import { resetRuleCacheForTest } from "../src/rules";
 import {
   answerRR,
@@ -32,6 +38,7 @@ describe("DoH worker", () => {
   beforeEach(() => {
     resetRuleCacheForTest();
     resetSharedEchCacheForTest();
+    resetEchEnhanceCachesForTest();
     vi.restoreAllMocks();
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
   });
@@ -723,6 +730,231 @@ describe("DoH worker", () => {
       const body = new Uint8Array(await response.arrayBuffer());
       const info = parseDnsMessage(body);
       expect(svcbGetEch(body, info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd)).toBeNull();
+    });
+  });
+
+  describe("ECH enhanced domains", () => {
+    const X_KEY = new Uint8Array([0xa1, 0x00, 0x42, 0x78, 0x2e, 0x63, 0x6f, 0x6d]);
+    const META_KEY = new Uint8Array([0xb2, 0x00, 0x42, 0x6d, 0x65, 0x74, 0x61]);
+    const OTHER_KEY = new Uint8Array([0xc3, 0x00, 0x42, 0x6f, 0x74, 0x68, 0x65, 0x72]);
+    const toB64 = (data: Uint8Array): string => {
+      let binary = "";
+      for (const byte of data) binary += String.fromCharCode(byte);
+      return btoa(binary);
+    };
+    const echEnv = {
+      X_DOMAINS: "x.com",
+      X_ECH_CONFIG_B64: toB64(X_KEY),
+      META_DOMAINS: "instagram.com,facebook.com",
+      META_ECH_CONFIG_B64: toB64(META_KEY),
+      DEBUG_HEADERS: "on"
+    };
+
+    const post = (name: string, type: number): Promise<Response> =>
+      envWithRules().then(({ env }) =>
+        handleRequest(
+          new Request("https://worker.example/doh", {
+            method: "POST",
+            headers: {
+              "content-type": "application/dns-message",
+              "x-forwarded-for": "1.2.3.9"
+            },
+            body: toArrayBuffer(makeQuery(name, type))
+          }),
+          { ...env, ...echEnv }
+        )
+      );
+
+    it("pins x.com A answers to CF-confirmed addresses", async () => {
+      const seen: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          const query = new Uint8Array(init?.body as ArrayBuffer);
+          const name = questionName(query);
+          seen.push(name);
+          const rrs =
+            name === "x.com.cdn.cloudflare.net"
+              ? [
+                  answerRR(1, new Uint8Array([104, 16, 1, 1])),
+                  answerRR(1, new Uint8Array([172, 64, 2, 2]))
+                ]
+              : [];
+          return new Response(toArrayBuffer(respondWithAnswers(query, rrs)), {
+            headers: { "content-type": "application/dns-message" }
+          });
+        })
+      );
+      const response = await post("x.com", 1);
+      expect(response.status).toBe(200);
+      expect(seen).toEqual(["x.com.cdn.cloudflare.net"]);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(info.answers.map((record) => Array.from(body.slice(record.rdataStart, record.rdataEnd)))).toEqual([
+        [104, 16, 1, 1],
+        [172, 64, 2, 2]
+      ]);
+      expect(response.headers.get("x-doh-debug")).toContain("up=ech-enhance");
+    });
+
+    it("falls back to normal resolution when Cloudflare is not serving x.com", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          const query = new Uint8Array(init?.body as ArrayBuffer);
+          // 确认名无记录 = CF 当前不服务 x.com；x.com 本体走普通解析。
+          const rrs = questionName(query) === "x.com.cdn.cloudflare.net" ? [] : [answerRR(1, new Uint8Array([9, 9, 9, 9]))];
+          return new Response(toArrayBuffer(respondWithAnswers(query, rrs)), {
+            headers: { "content-type": "application/dns-message" }
+          });
+        })
+      );
+      const response = await post("x.com", 1);
+      expect(response.status).toBe(200);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(Array.from(body.slice(info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd))).toEqual([9, 9, 9, 9]);
+      expect(response.headers.get("x-doh-debug")).not.toContain("ech-enhance");
+    });
+
+    it("suppresses AAAA for x domains without contacting upstreams", async () => {
+      let fetchCalls = 0;
+      vi.stubGlobal("fetch", vi.fn(async () => {
+        fetchCalls += 1;
+        return new Response(null, { status: 503 });
+      }));
+      const response = await post("x.com", 28);
+      expect(fetchCalls).toBe(0);
+      const body = new Uint8Array(await response.arrayBuffer());
+      expect(readU16(body, 2) & 0xf).toBe(0);
+      expect(readU16(body, 6)).toBe(0);
+    });
+
+    it("synthesizes an HTTPS answer for x.com with the dedicated key", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          const query = new Uint8Array(init?.body as ArrayBuffer);
+          expect(questionName(query)).toBe("x.com");
+          // 官方对 HTTPS 查询空回答（国内分到不支持 ECH 的 CDN 时的典型形态）。
+          return new Response(toArrayBuffer(respondWithAnswers(query, [])), {
+            headers: { "content-type": "application/dns-message" }
+          });
+        })
+      );
+      const response = await post("x.com", 65);
+      expect(response.status).toBe(200);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(info.answers).toHaveLength(1);
+      expect(info.answers[0]!.type).toBe(65);
+      expect(Array.from(svcbGetEch(body, info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd) ?? [])).toEqual([
+        ...X_KEY
+      ]);
+    });
+
+    it("injects the Meta key into instagram.com HTTPS answers", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          const query = new Uint8Array(init?.body as ArrayBuffer);
+          expect(questionName(query)).toBe("instagram.com");
+          return new Response(
+            toArrayBuffer(respondWithAnswers(query, [
+              answerRR(65, svcbRdata([{ key: 1, value: ALPN_H2 }]))
+            ])),
+            { headers: { "content-type": "application/dns-message" } }
+          );
+        })
+      );
+      const response = await post("instagram.com", 65);
+      expect(response.status).toBe(200);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(info.answers).toHaveLength(1);
+      expect(Array.from(svcbGetEch(body, info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd) ?? [])).toEqual([
+        ...META_KEY
+      ]);
+    });
+
+    it("leaves meta domain A queries untouched", async () => {
+      let fetchCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          fetchCalls += 1;
+          const query = new Uint8Array(init?.body as ArrayBuffer);
+          expect(questionName(query)).toBe("instagram.com");
+          return new Response(
+            toArrayBuffer(respondWithAnswers(query, [answerRR(1, new Uint8Array([57, 144, 4, 141]))])),
+            { headers: { "content-type": "application/dns-message" } }
+          );
+        })
+      );
+      const response = await post("instagram.com", 1);
+      expect(fetchCalls).toBe(1);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(Array.from(body.slice(info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd))).toEqual([57, 144, 4, 141]);
+    });
+
+    it("prefers the KV override key over the builtin one", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          const query = new Uint8Array(init?.body as ArrayBuffer);
+          return new Response(toArrayBuffer(respondWithAnswers(query, [])), {
+            headers: { "content-type": "application/dns-message" }
+          });
+        })
+      );
+      const { env, kv } = await envWithRules();
+      kv.values.set("echcfg:x", toB64(OTHER_KEY));
+      const response = await handleRequest(
+        new Request("https://worker.example/doh", {
+          method: "POST",
+          headers: {
+            "content-type": "application/dns-message",
+            "x-forwarded-for": "1.2.3.9"
+          },
+          body: toArrayBuffer(makeQuery("x.com", 65))
+        }),
+        { ...env, ...echEnv }
+      );
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(Array.from(svcbGetEch(body, info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd) ?? [])).toEqual([
+        ...OTHER_KEY
+      ]);
+    });
+
+    it("syncs rotated keys from the reference instance into KV", async () => {
+      const rotated = new Uint8Array([0xdd, 0x00, 0x42, 0x6e, 0x65, 0x77]);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request) => {
+          const url = String(input);
+          expect(url).toContain("ref.example");
+          const dns = url.split("dns=")[1] ?? "";
+          const binary = atob(dns.replace(/-/g, "+").replace(/_/g, "/"));
+          const query = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i += 1) query[i] = binary.charCodeAt(i);
+          const name = questionName(query);
+          // x.com 返回换过的新钥匙；instagram 返回与内置一致的钥匙（不应写 KV）。
+          const key = name === "x.com" ? rotated : META_KEY;
+          return new Response(
+            toArrayBuffer(respondWithAnswers(query, [
+              answerRR(65, svcbRdata([{ key: 5, value: key }]))
+            ])),
+            { headers: { "content-type": "application/dns-message" } }
+          );
+        })
+      );
+      const { env, kv } = await envWithRules();
+      const config = readConfig({ ...env, ...echEnv, ECH_SYNC_URL: "https://ref.example/pool" });
+      await syncEchKeys(env, config);
+      expect(kv.values.get("echcfg:x")).toBe(toB64(rotated));
+      expect(kv.values.has("echcfg:meta")).toBe(false);
     });
   });
 });

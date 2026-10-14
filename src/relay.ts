@@ -3,6 +3,8 @@ import { SVCB_ALPN_KEY, SVCB_ECH_KEY, TYPE_A, HTTPS_TYPE } from "./ech";
 import type { DnsMessageInfo } from "./dns";
 
 const RELAY_TTL_S = 120;
+// 钉地址（x.com → CF 确认 IP）走短 TTL：CF 收纳/退出站点时及时跟随。
+const PINNED_TTL_S = 60;
 
 /**
  * 解析 RELAY_DOMAINS（逗号分隔的域名后缀，小写归一）。
@@ -69,6 +71,16 @@ export function buildRelayAAnswer(
 ): Uint8Array {
   const rr = concatBytes([rrHead(TYPE_A, 4, RELAY_TTL_S), relayIpv4]);
   return withQuestion(query, parsed, [rr]);
+}
+
+/** A 查询 → 钉到给定地址列表（双 CDN 站统指：每地址一条 RR）。 */
+export function buildPinnedAAnswer(
+  query: Uint8Array,
+  parsed: DnsMessageInfo,
+  addresses: readonly Uint8Array[]
+): Uint8Array {
+  const rrs = addresses.map((address) => concatBytes([rrHead(TYPE_A, 4, PINNED_TTL_S), address]));
+  return withQuestion(query, parsed, rrs);
 }
 
 /** AAAA 查询 → NOERROR 零答案（中继不开放 IPv6，回空防直连绕过）。 */

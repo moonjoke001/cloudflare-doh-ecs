@@ -28,7 +28,12 @@
     "CACHE_MAX_AGE_S": "300",
     "DEBUG_HEADERS": "on",
     "RELAY_DOMAINS": "chatgpt.com,grok.com",
-    "RELAY_IPV4": "199.168.138.132"
+    "RELAY_IPV4": "199.168.138.132",
+    "X_DOMAINS": "x.com",
+    "X_ECH_CONFIG_B64": "AEX+DQBB1QAgACDHrss4Ckg/waeLaVKv5BDPKDQBB6Wme2+a2+FFHi8eVwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=",
+    "META_DOMAINS": "instagram.com,facebook.com",
+    "META_ECH_CONFIG_B64": "AEj+DQBEAQAgACAdd+scUi0IYFsXnUIU7ko2Nd9+F8M26pAGZVpz/KrWPgAEAAEAAWQVZWNoLXB1YmxpYy5hdG1ldGEuY29tAAA=",
+    "ECH_SYNC_URL": "https://edge.1molchuan.top/linuxdo"
   },
   "triggers": {
     "crons": ["17 3 * * *"]

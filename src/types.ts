@@ -21,6 +21,13 @@ export interface Env {
   DEBUG_HEADERS?: string;
   RELAY_DOMAINS?: string;
   RELAY_IPV4?: string;
+  // ECH 增强：双 CDN 大站统指（x.com）+ 服务器支持 ECH 但不发布公钥的站（Meta 系列）。
+  X_DOMAINS?: string;
+  X_ECH_CONFIG_B64?: string;
+  META_DOMAINS?: string;
+  META_ECH_CONFIG_B64?: string;
+  // 上游参考实例（提供换钥跟踪探测），定时同步公钥到 KV；留空禁用。
+  ECH_SYNC_URL?: string;
 }
 
 export interface RuleManifest {
