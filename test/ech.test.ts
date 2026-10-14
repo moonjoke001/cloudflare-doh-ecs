@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { svcbHasEch } from "../src/index";
+import { svcbHasEch } from "../src/ech";
 import { parseDnsMessage } from "../src/dns";
 import { concatBytes, writeU16 } from "../src/binary";
 

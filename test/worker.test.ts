@@ -1,8 +1,26 @@
-import { readU16, toArrayBuffer, writeU16, writeU32 } from "../src/binary";
+import { concatBytes, readU16, toArrayBuffer, writeU16, writeU32 } from "../src/binary";
 import { parseDnsMessage } from "../src/dns";
-import { handleRequest } from "../src/index";
+import { svcbGetEch } from "../src/ech";
+import { handleRequest, resetSharedEchCacheForTest } from "../src/index";
 import { resetRuleCacheForTest } from "../src/rules";
-import { envWithRules, makeQuery, makeResponseFromQuery, MemoryKv } from "./helpers";
+import {
+  answerRR,
+  envWithRules,
+  makeQuery,
+  makeResponseFromQuery,
+  respondWithAnswers,
+  svcbRdata,
+  MemoryKv
+} from "./helpers";
+
+const FAKE_ECH = new Uint8Array([0xde, 0xad, 0xbe, 0xef, 0x00, 0x42]);
+const ALPN_H2 = new Uint8Array([0x02, 0x68, 0x32]);
+
+function questionName(body: Uint8Array): string {
+  return parseDnsMessage(body)
+    .question.name.labels.map((label) => String.fromCharCode(...label))
+    .join(".");
+}
 
 function base64Url(data: Uint8Array): string {
   let binary = "";
@@ -13,6 +31,7 @@ function base64Url(data: Uint8Array): string {
 describe("DoH worker", () => {
   beforeEach(() => {
     resetRuleCacheForTest();
+    resetSharedEchCacheForTest();
     vi.restoreAllMocks();
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
   });
@@ -522,5 +541,188 @@ describe("DoH worker", () => {
     );
     expect(response.status).toBe(200);
     expect(readU16(new Uint8Array(await response.arrayBuffer()), 2) & 0xf).toBe(2);
+  });
+
+  describe("AI relay domains", () => {
+    const relayEnv = {
+      RELAY_DOMAINS: "chatgpt.com, grok.com",
+      RELAY_IPV4: "45.60.70.80",
+      DEBUG_HEADERS: "on"
+    };
+
+    const post = (name: string, type: number): Promise<Response> =>
+      envWithRules().then(({ env }) =>
+        handleRequest(
+          new Request("https://worker.example/doh", {
+            method: "POST",
+            headers: {
+              "content-type": "application/dns-message",
+              "x-forwarded-for": "1.2.3.9"
+            },
+            body: toArrayBuffer(makeQuery(name, type))
+          }),
+          { ...env, ...relayEnv }
+        )
+      );
+
+    it("answers A queries with the relay IPv4 without contacting upstreams", async () => {
+      let fetchCalls = 0;
+      vi.stubGlobal("fetch", vi.fn(async () => {
+        fetchCalls += 1;
+        return new Response(null, { status: 503 });
+      }));
+      const response = await post("chatgpt.com", 1);
+      expect(response.status).toBe(200);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(info.answers).toHaveLength(1);
+      expect(info.answers[0]!.type).toBe(1);
+      expect(Array.from(body.slice(info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd))).toEqual([
+        45, 60, 70, 80
+      ]);
+      expect(fetchCalls).toBe(0);
+      expect(response.headers.get("x-doh-debug")).toContain("up=relay");
+    });
+
+    it("relays subdomains of listed domains too", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 503 })));
+      const response = await post("ab.chatgpt.com", 1);
+      const info = parseDnsMessage(new Uint8Array(await response.arrayBuffer()));
+      expect(info.answers).toHaveLength(1);
+      expect(info.answers[0]!.type).toBe(1);
+    });
+
+    it("answers AAAA queries with NOERROR and zero records", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 503 })));
+      const response = await post("chatgpt.com", 28);
+      const body = new Uint8Array(await response.arrayBuffer());
+      expect(readU16(body, 2) & 0xf).toBe(0);
+      expect(readU16(body, 6)).toBe(0);
+      expect(readU16(body, 8)).toBe(0);
+    });
+
+    it("synthesizes an HTTPS answer with alpn h2 and the shared ECH config", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+          const query = new Uint8Array(init?.body as ArrayBuffer);
+          expect(questionName(query)).toBe("cloudflare-ech.com");
+          return new Response(toArrayBuffer(respondWithAnswers(query, [
+            answerRR(65, svcbRdata([{ key: 5, value: FAKE_ECH }]))
+          ])), { headers: { "content-type": "application/dns-message" } });
+        })
+      );
+      const response = await post("chatgpt.com", 65);
+      expect(response.status).toBe(200);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(info.answers).toHaveLength(1);
+      expect(info.answers[0]!.type).toBe(65);
+      expect(Array.from(svcbGetEch(body, info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd) ?? [])).toEqual([
+        ...FAKE_ECH
+      ]);
+    });
+
+    it("leaves non-relay domains untouched", async () => {
+      const destinations: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+          destinations.push(String(input));
+          const body = new Uint8Array(init?.body as ArrayBuffer);
+          return new Response(toArrayBuffer(makeResponseFromQuery(body)), {
+            headers: { "content-type": "application/dns-message" }
+          });
+        })
+      );
+      // 用全新域名+子网，避开前面用例 stub 残留的 caches 条目。
+      const response = await post("nonrelay.example.org", 1);
+      expect(response.status).toBe(200);
+      expect(destinations).toEqual(["https://cloudflare-dns.com/dns-query"]);
+    });
+  });
+
+  describe("shared ECH injection", () => {
+    const httpsNoEch = (hints: Uint8Array): ((input: string | URL | Request, init?: RequestInit) => Promise<Response>) =>
+      async (_input, init) => {
+        const query = new Uint8Array(init?.body as ArrayBuffer);
+        const name = questionName(query);
+        if (name === "cloudflare-ech.com") {
+          return new Response(toArrayBuffer(respondWithAnswers(query, [
+            answerRR(65, svcbRdata([{ key: 5, value: FAKE_ECH }]))
+          ])), { headers: { "content-type": "application/dns-message" } });
+        }
+        return new Response(toArrayBuffer(respondWithAnswers(query, [
+          answerRR(65, svcbRdata([
+            { key: 1, value: ALPN_H2 },
+            { key: 4, value: hints }
+          ]))
+        ])), { headers: { "content-type": "application/dns-message" } });
+      };
+
+    it("splices the shared ECH key into CF-hosted HTTPS answers without ech", async () => {
+      const destinations: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+          destinations.push(String(input));
+          return httpsNoEch(new Uint8Array([104, 16, 1, 1]))(input, init);
+        })
+      );
+      const { env } = await envWithRules();
+      const response = await handleRequest(
+        new Request("https://worker.example/doh", {
+          method: "POST",
+          headers: {
+            "content-type": "application/dns-message",
+            "x-forwarded-for": "1.2.3.9"
+          },
+          body: toArrayBuffer(makeQuery("grok.com", 65))
+        }),
+        env
+      );
+      expect(response.status).toBe(200);
+      // 主查 → CF 官方补查 → cloudflare-ech.com 共享公钥引导，共 3 次出网。
+      expect(destinations).toEqual([
+        "https://cloudflare-dns.com/dns-query",
+        "https://cloudflare-dns.com/dns-query",
+        "https://cloudflare-dns.com/dns-query"
+      ]);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(info.answers[0]!.type).toBe(65);
+      expect(Array.from(svcbGetEch(body, info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd) ?? [])).toEqual([
+        ...FAKE_ECH
+      ]);
+    });
+
+    it("skips injection when hints point outside Cloudflare", async () => {
+      let fetchCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+          fetchCalls += 1;
+          return httpsNoEch(new Uint8Array([8, 8, 8, 8]))(input, init);
+        })
+      );
+      const { env } = await envWithRules();
+      const response = await handleRequest(
+        new Request("https://worker.example/doh", {
+          method: "POST",
+          headers: {
+            "content-type": "application/dns-message",
+            "x-forwarded-for": "1.2.3.9"
+          },
+          body: toArrayBuffer(makeQuery("example.net", 65))
+        }),
+        env
+      );
+      expect(response.status).toBe(200);
+      // 仅主查 + CF 官方补查，不引导共享公钥。
+      expect(fetchCalls).toBe(2);
+      const body = new Uint8Array(await response.arrayBuffer());
+      const info = parseDnsMessage(body);
+      expect(svcbGetEch(body, info.answers[0]!.rdataStart, info.answers[0]!.rdataEnd)).toBeNull();
+    });
   });
 });

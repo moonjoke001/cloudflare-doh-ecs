@@ -21,6 +21,23 @@ import {
   updateRules,
   type LoadedRules
 } from "./rules";
+import {
+  buildQuery,
+  firstEchValue,
+  hasHttpsAnswer,
+  httpsHintsAllCloudflare,
+  spliceEchIntoAnswers,
+  svcbHasEch,
+  HTTPS_TYPE,
+  TYPE_A,
+  TYPE_AAAA
+} from "./ech";
+import {
+  buildRelayAAnswer,
+  buildRelayEmptyAnswer,
+  buildRelayHttpsAnswer,
+  matchRelayDomain
+} from "./relay";
 import { readConfig, type Upstream, type WorkerConfig } from "./config";
 import type { Env } from "./types";
 
@@ -394,31 +411,6 @@ function subnetLabel(subnet: EcsSubnet | null): string {
   return `${[...subnet.network].join(".")}/${subnet.prefixLength}`;
 }
 
-const SVCB_ECH_KEY = 5;
-const HTTPS_TYPE = 65;
-
-/**
- * 扫描 SVCB/HTTPS rdata 的参数区，判断是否带 ech（SvcParamKey=5）。
- * rdata 布局：priority(2) + target(name) + (key(2)+len(2)+value)*。
- */
-export function svcbHasEch(data: Uint8Array, start: number, end: number): boolean {
-  if (start + 2 > end) return false;
-  let cursor = start + 2; // 跳过 priority
-  try {
-    const target = parseName(data, cursor);
-    cursor = target.nextOffset;
-  } catch {
-    return false;
-  }
-  while (cursor + 4 <= end) {
-    const key = readU16(data, cursor);
-    const length = readU16(data, cursor + 2);
-    if (cursor + 4 + length > end) return false;
-    if (key === SVCB_ECH_KEY) return true;
-    cursor += 4 + length;
-  }
-  return false;
-}
 
 function answerHasEch(body: Uint8Array, info: DnsMessageInfo): boolean {
   return info.answers.some(
@@ -426,11 +418,48 @@ function answerHasEch(body: Uint8Array, info: DnsMessageInfo): boolean {
   );
 }
 
+// ─── 共享 ECH 公钥引导 ───────────────────────────────────────────────
+// CF 托管站点共用一套服务端 ECH 公钥，但很多域名自己不在 DNS 里发布。
+// cloudflare-ech.com 的 HTTPS 记录里带的就是这把公钥，冷启动取一次、
+// 进程内缓存 1 小时（取失败短缓存 5 分钟，避免每次查询都打上游）。
+const SHARED_ECH_SOURCE = "cloudflare-ech.com";
+const SHARED_ECH_TTL_MS = 60 * 60 * 1000;
+const SHARED_ECH_FAILURE_TTL_MS = 5 * 60 * 1000;
+let sharedEchCache: { value: Uint8Array | null; expiresAt: number } | null = null;
+
+export function resetSharedEchCacheForTest(): void {
+  sharedEchCache = null;
+}
+
+async function getSharedEchConfig(config: WorkerConfig): Promise<Uint8Array | null> {
+  const now = Date.now();
+  if (sharedEchCache !== null && now < sharedEchCache.expiresAt) {
+    return sharedEchCache.value;
+  }
+  let value: Uint8Array | null = null;
+  try {
+    const query = buildQuery(SHARED_ECH_SOURCE, HTTPS_TYPE);
+    const body = await fetchUpstream(config.global[0]!.url, query, config.upstreamTimeoutMs);
+    const info = parseDnsMessage(body);
+    if ((info.flags & 0x000f) === 0) value = firstEchValue(body, info);
+  } catch {
+    value = null;
+  }
+  sharedEchCache = {
+    value,
+    expiresAt: now + (value === null ? SHARED_ECH_FAILURE_TTL_MS : SHARED_ECH_TTL_MS)
+  };
+  return value;
+}
+
 /**
- * HTTPS(65) 查询且上游答案没带 ech 时，向 Cloudflare 官方解析器补查同一条
- * HTTPS 记录：CF 托管站若开了 ECH，官方解析器的答案里一定带 ech 配置。
- * 拿到带 ech 的答案就整体替换返回（同一权威数据），拿不到维持原答案。
- * 仅对全球组启用：国内域名单独多打一发查询不划算，且 CF 站点极少命中。
+ * HTTPS(65) 查询且上游答案没带 ech 时的两级补齐：
+ * ① 向 Cloudflare 官方解析器补查同一条 HTTPS 记录（有的 CF 站官方答案自带 ech）；
+ * ② 官方答案仍缺 ech（如 grok.com 这类没发布的）→ 先用 ipv4hint 确认站点确实
+ *    托管在 CF，再从 cloudflare-ech.com 取共享公钥拼进答案。CF 服务端全站共用
+ *    一把 ECH 私钥，补了公钥浏览器就能对这类站点发起 ECH。
+ * 拿不到带 ech 的答案就维持原答案。仅对全球组启用：国内域名单独多打
+ * 一发查询不划算，且 CF 站点极少命中。
  */
 async function maybeUpgradeEch(
   cleanQuery: Uint8Array,
@@ -446,8 +475,13 @@ async function maybeUpgradeEch(
     const info = validateUpstreamResponse(body, parsed);
     const rcode = info.flags & 0x000f;
     if (rcode !== 0 && rcode !== 3) return null;
-    if (!answerHasEch(body, info)) return null;
-    return body;
+    if (answerHasEch(body, info)) return body;
+    // ② 共享公钥注入：官方答案确有 HTTPS 记录、hint 可确认 CF 托管时才动手。
+    if (!hasHttpsAnswer(info)) return null;
+    if (!httpsHintsAllCloudflare(body, info)) return null;
+    const shared = await getSharedEchConfig(config);
+    if (shared === null) return null;
+    return spliceEchIntoAnswers(body, info, shared);
   } catch {
     return null;
   }
@@ -496,6 +530,33 @@ async function handleDns(
   }
   const upstreams = domestic ? config.domestic : config.global;
   const group = domestic ? "domestic" : "global";
+
+  // AI 中继：命中域名的 A/AAAA/HTTPS 由自建中继应答（出口换境外 IP），
+  // 其余类型照常走上游。A 需要中继地址、HTTPS 需要共享公钥，缺哪个就
+  // 落回普通解析，绝不返回半配置的答案。
+  const relayDomain = matchRelayDomain(config.relayDomains, ruleName);
+  if (relayDomain !== null && config.relayIpv4 !== null) {
+    const relayDebug = debugHeaders(config, env, {
+      cache: "miss/relay",
+      group,
+      domestic,
+      rulesVersion: rules?.version ?? null,
+      subnet: subnetLabel(subnet),
+      upstream: "relay"
+    });
+    if (parsed.question.type === TYPE_A) {
+      return dnsResponse(buildRelayAAnswer(originalQuery, parsed, config.relayIpv4), 200, relayDebug);
+    }
+    if (parsed.question.type === TYPE_AAAA) {
+      return dnsResponse(buildRelayEmptyAnswer(originalQuery, parsed), 200, relayDebug);
+    }
+    if (parsed.question.type === HTTPS_TYPE) {
+      const echValue = await getSharedEchConfig(config);
+      if (echValue !== null) {
+        return dnsResponse(buildRelayHttpsAnswer(originalQuery, parsed, echValue), 200, relayDebug);
+      }
+    }
+  }
 
   // 主备都按“带 ECS”查一遍键再按“干净”查一遍；命中任一直接返回（改写 txid 回原查询）。
   if (config.cacheMaxAgeS > 0) {

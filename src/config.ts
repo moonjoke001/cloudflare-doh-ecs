@@ -1,4 +1,5 @@
 import { isGlobalUnicast, parseIp } from "./ip";
+import { parseRelayDomains } from "./relay";
 import type { Env } from "./types";
 
 const DEFAULT_DOMESTIC = "https://dns.alidns.com/dns-query";
@@ -22,6 +23,9 @@ export interface WorkerConfig {
   hedgeDelayMs: number;
   cacheMaxAgeS: number;
   debugHeaders: boolean;
+  // AI 中继：命中域名的 A/HTTPS 改指自建 TCP 中继，其余解析不受影响。
+  relayDomains: readonly string[];
+  relayIpv4: Uint8Array | null;
   // 兼容旧配置：保留纯 URL 数组供外部引用。
   domesticUrls: readonly [string, string];
   globalUrls: readonly [string, string];
@@ -80,6 +84,15 @@ function parseEcsScope(value: string | undefined, fallback: EcsScope): EcsScope 
   throw new Error("invalid_ecs_scope");
 }
 
+function parseRelayIpv4(value: string | undefined): Uint8Array | null {
+  if (value === undefined || value.trim() === "") return null;
+  const parsed = parseIp(value.trim());
+  if (parsed === null || parsed.family !== 1 || !isGlobalUnicast(parsed)) {
+    throw new Error("invalid_relay_ipv4");
+  }
+  return parsed.bytes;
+}
+
 function parseBoundedInt(
   value: string | undefined,
   fallback: number,
@@ -124,6 +137,8 @@ export function readConfig(env: Env): WorkerConfig {
     hedgeDelayMs: parseBoundedInt(env.HEDGE_DELAY_MS, 800, 0, 5000, "invalid_hedge_delay"),
     cacheMaxAgeS: parseBoundedInt(env.CACHE_MAX_AGE_S, 300, 0, 86400, "invalid_cache_age"),
     debugHeaders: env.DEBUG_HEADERS === "on",
+    relayDomains: parseRelayDomains(env.RELAY_DOMAINS),
+    relayIpv4: parseRelayIpv4(env.RELAY_IPV4),
     domesticUrls: [domestic[0].url, domestic[1].url],
     globalUrls: [global[0].url, global[1].url]
   };

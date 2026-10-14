@@ -19,6 +19,8 @@ export interface Env {
   CACHE_MAX_AGE_S?: string;
   // "on" 时响应带 x-doh-debug 头（分流决策/规则版本），排查线上用。
   DEBUG_HEADERS?: string;
+  RELAY_DOMAINS?: string;
+  RELAY_IPV4?: string;
 }
 
 export interface RuleManifest {

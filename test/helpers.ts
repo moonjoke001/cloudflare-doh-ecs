@@ -1,4 +1,5 @@
-import { toArrayBuffer, writeU16, writeU32 } from "../src/binary";
+import { concatBytes, toArrayBuffer, writeU16, writeU32 } from "../src/binary";
+import { parseDnsMessage } from "../src/dns";
 import type { Env, RuleManifest } from "../src/types";
 
 export function encodeName(name: string): Uint8Array {
@@ -147,4 +148,42 @@ export async function envWithRules(
     kv,
     version
   };
+}
+
+/** 构造 ServiceMode HTTPS rdata：priority=1 + target=. + 参数列表。 */
+export function svcbRdata(params: Array<{ key: number; value: Uint8Array }>): Uint8Array {
+  const parts: Uint8Array[] = [new Uint8Array([0, 1, 0])];
+  for (const p of params) {
+    const item = new Uint8Array(4 + p.value.length);
+    item[0] = p.key >> 8;
+    item[1] = p.key & 0xff;
+    item[2] = p.value.length >> 8;
+    item[3] = p.value.length & 0xff;
+    item.set(p.value, 4);
+    parts.push(item);
+  }
+  return concatBytes(parts);
+}
+
+/** 以 0xc00c 指回问题名的 RR 头 + rdata。 */
+export function answerRR(rtype: number, rdata: Uint8Array, ttl = 60): Uint8Array {
+  const head = new Uint8Array(12); // 名字(2) + type(2) + class(2) + ttl(4) + rdlength(2)
+  head[0] = 0xc0;
+  head[1] = 0x0c;
+  writeU16(head, 2, rtype);
+  writeU16(head, 4, 1);
+  writeU32(head, 6, ttl);
+  writeU16(head, 10, rdata.length);
+  return concatBytes([head, rdata]);
+}
+
+/** 以查询的问题段重建响应（丢弃查询尾部可能的 OPT）+ QR/RA + 答案。 */
+export function respondWithAnswers(query: Uint8Array, rrs: Uint8Array[]): Uint8Array {
+  const parsed = parseDnsMessage(query);
+  const header = new Uint8Array(12);
+  writeU16(header, 0, parsed.id);
+  writeU16(header, 2, 0x8180 | (parsed.flags & 0x0100));
+  writeU16(header, 4, 1);
+  writeU16(header, 6, rrs.length);
+  return concatBytes([header, query.slice(12, parsed.question.endOffset), ...rrs]);
 }

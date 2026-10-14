@@ -26,7 +26,9 @@
     "UPSTREAM_TIMEOUT_MS": "1500",
     "HEDGE_DELAY_MS": "800",
     "CACHE_MAX_AGE_S": "300",
-    "DEBUG_HEADERS": "on"
+    "DEBUG_HEADERS": "on",
+    "RELAY_DOMAINS": "chatgpt.com,grok.com",
+    "RELAY_IPV4": "199.168.138.132"
   },
   "triggers": {
     "crons": ["17 3 * * *"]
