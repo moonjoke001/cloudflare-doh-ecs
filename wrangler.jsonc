@@ -28,7 +28,7 @@
     "CACHE_MAX_AGE_S": "300",
     "DEBUG_HEADERS": "on",
     "RELAY_DOMAINS": "chatgpt.com,grok.com",
-    "RELAY_IPV4": "199.168.138.132"
+    "RELAY_IPV4": "192.129.200.200"
   },
   "triggers": {
     "crons": ["17 3 * * *"]
