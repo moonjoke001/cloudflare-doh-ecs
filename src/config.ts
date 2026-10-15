@@ -7,6 +7,9 @@ const DEFAULT_DOMESTIC_FALLBACK = "https://doh.pub/dns-query";
 const DEFAULT_GLOBAL = "https://cloudflare-dns.com/dns-query";
 const DEFAULT_GLOBAL_FALLBACK = "https://dns.google/dns-query";
 const DEFAULT_PATH = "/doh";
+// 浏览器（Chrome/Edge 安全 DNS 自定义提供商）填完地址会向标准 /dns-query 发探测，
+// 探测失败就拒绝保存。默认路径下接受该别名；用户自定义隐藏路径时不附带。
+export const DEFAULT_PATH_ALIAS = "/dns-query";
 
 export type EcsScope = "on" | "off" | "cf-only";
 
@@ -17,6 +20,8 @@ export interface Upstream {
 
 export interface WorkerConfig {
   path: string;
+  /** 默认路径附带的浏览器兼容别名；自定义隐藏路径时为 null。 */
+  pathAlias: string | null;
   domestic: readonly [Upstream, Upstream];
   global: readonly [Upstream, Upstream];
   upstreamTimeoutMs: number;
@@ -156,8 +161,10 @@ export function readConfig(env: Env): WorkerConfig {
       ecs: parseEcsScope(env.GLOBAL_FALLBACK_DOH_ECS, "off")
     }
   ];
+  const dohPath = validatePath(env.DOH_PATH);
   return {
-    path: validatePath(env.DOH_PATH),
+    path: dohPath,
+    pathAlias: dohPath === DEFAULT_PATH ? DEFAULT_PATH_ALIAS : null,
     domestic,
     global,
     upstreamTimeoutMs: parseBoundedInt(env.UPSTREAM_TIMEOUT_MS, 1500, 200, 10000, "invalid_timeout"),

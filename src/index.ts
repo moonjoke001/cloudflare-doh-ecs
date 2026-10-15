@@ -39,7 +39,7 @@ import {
   buildRelayHttpsAnswer,
   matchRelayDomain
 } from "./relay";
-import { readConfig, type Upstream, type WorkerConfig } from "./config";
+import { DEFAULT_PATH_ALIAS, readConfig, type Upstream, type WorkerConfig } from "./config";
 import type { Env } from "./types";
 
 const MAX_REQUEST_BYTES = 4096;
@@ -101,6 +101,11 @@ function emptyResponse(status: number, extraHeaders?: HeadersInit): Response {
   return new Response(null, { status, headers });
 }
 
+/** 主路径 + 默认别名（自定义 DOH_PATH 时无别名）。 */
+function isDohPath(pathname: string, config: WorkerConfig): boolean {
+  return pathname === config.path || (config.pathAlias !== null && pathname === config.pathAlias);
+}
+
 function dnsResponse(
   body: Uint8Array,
   status = 200,
@@ -149,7 +154,7 @@ function decodeBase64Url(value: string): Uint8Array | null {
 
 async function readDnsRequest(request: Request, config: WorkerConfig): Promise<Response | Uint8Array> {
   const url = new URL(request.url);
-  if (url.pathname !== config.path) return emptyResponse(404);
+  if (!isDohPath(url.pathname, config)) return emptyResponse(404);
 
   if (request.method === "GET") {
     const values = url.searchParams.getAll("dns");
@@ -886,7 +891,8 @@ export async function handleRequest(
   } catch {
     const url = new URL(request.url);
     const expectedPath = env.DOH_PATH ?? "/doh";
-    if (url.pathname !== expectedPath) return emptyResponse(404);
+    const expectedAlias = expectedPath === "/doh" ? DEFAULT_PATH_ALIAS : null;
+    if (url.pathname !== expectedPath && url.pathname !== expectedAlias) return emptyResponse(404);
     let query = new Uint8Array();
     if (request.method === "POST") {
       try {

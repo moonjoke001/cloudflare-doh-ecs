@@ -7,6 +7,7 @@ describe("worker configuration", () => {
   it("uses safe defaults and accepts valid overrides", () => {
     expect(readConfig(base())).toMatchObject({
       path: "/doh",
+      pathAlias: "/dns-query",
       domestic: [
         { url: "https://dns.alidns.com/dns-query", ecs: "on" },
         { url: "https://doh.pub/dns-query", ecs: "on" }
@@ -32,6 +33,7 @@ describe("worker configuration", () => {
       })
     ).toMatchObject({
       path: "/private-doh",
+      pathAlias: null,
       global: [
         { url: "https://resolver.example/dns-query", ecs: "cf-only" },
         { url: "https://backup.example/dns-query", ecs: "off" }

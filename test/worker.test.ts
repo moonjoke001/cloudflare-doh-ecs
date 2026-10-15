@@ -239,6 +239,55 @@ describe("DoH worker", () => {
     ]);
   });
 
+  it("accepts the /dns-query alias under the default path", async () => {
+    const { env } = await envWithRules();
+    // 生产 wrangler.jsonc 显式写了 DOH_PATH="/doh"，别名同样要生效。
+    const explicitDefaultEnv = { ...env, DOH_PATH: "/doh" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const body = new Uint8Array(init?.body as ArrayBuffer);
+        return new Response(toArrayBuffer(makeResponseFromQuery(body)), {
+          headers: { "content-type": "application/dns-message" }
+        });
+      })
+    );
+    const query = makeQuery("example.net", 66);
+    for (const e of [env, explicitDefaultEnv]) {
+      const response = await handleRequest(
+        new Request(`https://worker.example/dns-query?dns=${base64Url(query)}`),
+        e
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("application/dns-message");
+    }
+  });
+
+  it("rejects /dns-query when DOH_PATH is customized", async () => {
+    const { env } = await envWithRules();
+    const customEnv = { ...env, DOH_PATH: "/private-doh" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const body = new Uint8Array(init?.body as ArrayBuffer);
+        return new Response(toArrayBuffer(makeResponseFromQuery(body)), {
+          headers: { "content-type": "application/dns-message" }
+        });
+      })
+    );
+    const query = makeQuery("example.net", 66);
+    const aliased = await handleRequest(
+      new Request(`https://worker.example/dns-query?dns=${base64Url(query)}`),
+      customEnv
+    );
+    expect(aliased.status).toBe(404);
+    const main = await handleRequest(
+      new Request(`https://worker.example/private-doh?dns=${base64Url(query)}`),
+      customEnv
+    );
+    expect(main.status).toBe(200);
+  });
+
   function ecsBytes(body: Uint8Array): number[] | null {
     // 返回报文中 ECS 选项的原始字节；无 ECS 时返回 null。
     const parsed = parseDnsMessage(body);
